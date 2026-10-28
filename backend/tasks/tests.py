@@ -170,6 +170,31 @@ class TaskFlowApiTests(TestCase):
         self.assertEqual(response.data["assistant_messages"][0]["kind"], "error")
         self.assertIn("Priority must be low, medium, or high", response.data["assistant_messages"][0]["text"])
 
+    @patch("tasks.views.interpret", return_value=None)
+    def test_edit_description_from_chat(self, _interpret):
+        task = Task.objects.create(title="Write deployment guide")
+        response = self.chat("Edit the deployment guide task description to include rollback and monitoring instructions")
+        task.refresh_from_db()
+        self.assertEqual(task.description, "include rollback and monitoring instructions")
+        self.assertIn("updated the description", response.data["assistant_messages"][0]["text"])
+
+    @patch("tasks.views.interpret", return_value=None)
+    def test_set_due_date_from_chat(self, _interpret):
+        task = Task.objects.create(title="Review security checklist")
+        response = self.chat("Set the due date of the security checklist task to 06-11-2026")
+        task.refresh_from_db()
+        self.assertEqual(task.due_date.isoformat(), "2026-11-06")
+        self.assertIn("2026-11-06", response.data["assistant_messages"][0]["text"])
+
+    @patch("tasks.views.interpret", return_value=None)
+    def test_remove_due_date_does_not_start_delete_flow(self, _interpret):
+        task = Task.objects.create(title="Test notification system", due_date=timezone.localdate())
+        response = self.chat("Remove the due date from the notification system task")
+        task.refresh_from_db()
+        self.assertIsNone(task.due_date)
+        self.assertIsNone(task.deleted_at)
+        self.assertNotIn("Which task(s) should I delete?", response.data["assistant_messages"][0]["text"])
+
     @patch("tasks.views.interpret", return_value={"kind": "status", "title": "Product demo", "status": "in_progress"})
     def test_status_command_reports_the_transition(self, _interpret):
         task = Task.objects.create(title="Prepare the product demo", status=Task.Status.TODO)
@@ -289,6 +314,14 @@ class TaskFlowApiTests(TestCase):
         self.assertEqual(board.data["tasks"][0]["title"], "Tomorrow task")
 
     @patch("tasks.views.interpret", return_value=None)
+    def test_due_tomorrow_phrase_does_not_search_for_due_text(self, _interpret):
+        Task.objects.create(title="Tomorrow task", due_date=timezone.localdate() + timedelta(days=1))
+        Task.objects.create(title="Another tomorrow task", due_date=timezone.localdate() + timedelta(days=1))
+        response = self.chat("Show me all tasks due tomorrow")
+        self.assertEqual(response.data["assistant_messages"][0]["text"], "Found 2 task(s).")
+        self.assertEqual(response.data["filter"], {"due": "tomorrow"})
+
+    @patch("tasks.views.interpret", return_value=None)
     def test_no_due_date_search_filters_tasks_without_due_date(self, _interpret):
         Task.objects.create(title="Undated task")
         Task.objects.create(title="Dated task", due_date=timezone.localdate())
@@ -298,6 +331,25 @@ class TaskFlowApiTests(TestCase):
         board = self.client.get("/api/v1/tasks/?due=none")
         self.assertEqual(board.data["count"], 1)
         self.assertEqual(board.data["tasks"][0]["title"], "Undated task")
+
+    @patch("tasks.views.interpret", return_value=None)
+    def test_no_due_date_phrase_does_not_search_for_connector_words(self, _interpret):
+        Task.objects.create(title="Undated one")
+        Task.objects.create(title="Undated two")
+        Task.objects.create(title="Dated task", due_date=timezone.localdate())
+        response = self.chat("Show me all tasks which have no due date")
+        self.assertEqual(response.data["assistant_messages"][0]["text"], "Found 2 task(s).")
+        self.assertEqual(response.data["filter"], {"due": "none"})
+
+    @patch("tasks.views.interpret", return_value=None)
+    def test_in_progress_status_search_uses_status_filter(self, _interpret):
+        Task.objects.create(title="Active task", status=Task.Status.PROGRESS)
+        Task.objects.create(title="Todo task", status=Task.Status.TODO)
+        response = self.chat("Show all in progress task")
+        self.assertEqual(response.data["assistant_messages"][0]["text"], "Found 1 task(s).")
+        self.assertEqual(response.data["filter"], {"status": "progress"})
+        board = self.client.get("/api/v1/tasks/?status=progress")
+        self.assertEqual(board.data["count"], 1)
 
     @patch("tasks.views.interpret", return_value=None)
     def test_multiple_numbered_choice_and_misspelled_cancel(self, _interpret):

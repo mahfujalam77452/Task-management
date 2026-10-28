@@ -63,8 +63,8 @@ def filtered_tasks(params=None):
         qs = qs.filter(id__in=[task.id for task in matching])
     if status == "open":
         qs = qs.exclude(status=Task.Status.DONE)
-    elif status in ("todo", "in-progress", "in_progress", "done"):
-        qs = qs.filter(status=status.replace("-", "_"))
+    elif status in ("todo", "progress", "in-progress", "in_progress", "done"):
+        qs = qs.filter(status={"progress": "in_progress"}.get(status, status.replace("-", "_")))
     if priority in ("low", "medium", "high"):
         qs = qs.filter(priority=priority)
     if due == "none":
@@ -244,13 +244,29 @@ def local_command(text):
             raw_query = re.sub(r"\btomorrow\b", "", raw_query, flags=re.I).strip()
         elif due_filter == "none":
             raw_query = re.sub(r"\b(no|without| missing)\s+due\s+date\b|\bno[-\s]+due\b", "", raw_query, flags=re.I).strip()
+        if due_filter in {"today", "tomorrow"}:
+            raw_query = re.sub(r"\bdue(?:\s+date)?\b", "", raw_query, flags=re.I).strip()
+        elif due_filter == "none":
+            raw_query = re.sub(r"\b(which|that|who)\s+(have|has|with|are)\b", "", raw_query, flags=re.I).strip()
         q = normalize_query(raw_query)
+        status_filter = (
+            "progress" if re.search(r"\bin[-\s]+progress\b", lower) else
+            "todo" if re.search(r"\b(to[-\s]+do|todo)\b", lower) else
+            "done" if re.search(r"\b(completed|done)\b", lower) else
+            None
+        )
+        if status_filter:
+            raw_query = re.sub(r"\bin[-\s]+progress\b|\bto[-\s]+do\b|\btodo\b|\bcompleted\b|\bdone\b", "", raw_query, flags=re.I)
+            q = normalize_query(raw_query)
+            tasks = tasks.filter(status={"progress": Task.Status.PROGRESS, "todo": Task.Status.TODO, "done": Task.Status.DONE}[status_filter])
         due_date = timezone.localdate() if due_filter == "today" else timezone.localdate() + timedelta(days=1) if due_filter == "tomorrow" else None
         if due_filter == "none":
             tasks = tasks.filter(due_date__isnull=True)
         elif due_date:
             tasks = tasks.filter(due_date=due_date)
-        if re.search(r"\b(completed|done)\b", lower):
+        if status_filter:
+            found = tasks
+        elif re.search(r"\b(completed|done)\b", lower):
             found = tasks.filter(status=Task.Status.DONE)
         elif re.search(r"\b(unfinished|open)\b", lower):
             found = tasks.exclude(status=Task.Status.DONE)
@@ -263,6 +279,52 @@ def local_command(text):
             found = semantic_tasks(q, tasks) if q else list(tasks)
         found_list = list(found)
         return "success", f"Found {len(found_list)} task(s).", found_list, None
+    description_match = re.match(
+        r"^(?:edit|update|change)\s+(?:the\s+)?(.+?)\s+task(?:'s)?\s+description\s+to\s+(.+)$",
+        text,
+        re.I,
+    )
+    due_match = (
+        re.match(
+            r"^(?:set|edit|update|change)\s+(?:the\s+)?due\s+date\s+(?:of\s+)?(.+?)\s+task\s+to\s+(.+)$",
+            text,
+            re.I,
+        )
+        or re.match(
+            r"^(?:set|edit|update|change)\s+(?:the\s+)?(.+?)\s+task(?:'s)?\s+due\s+date\s+to\s+(.+)$",
+            text,
+            re.I,
+        )
+    )
+    clear_due_match = re.match(
+        r"^(?:remove|clear)\s+(?:the\s+)?due\s+date\s+from\s+(?:the\s+)?(.+?)(?:\s+task)?$",
+        text,
+        re.I,
+    )
+    if description_match or due_match or clear_due_match:
+        match = description_match or due_match or clear_due_match
+        phrase = match.group(1).strip()
+        found = resolve_title_candidates(phrase, tasks)
+        if len(found) != 1:
+            return "question", "Which task should I update?", found, {"operation": "update"}
+        task = Task.objects.select_for_update().get(pk=found[0].pk, deleted_at__isnull=True)
+        if description_match:
+            description = description_match.group(2).strip()
+            if len(description) > 1000:
+                return "error", "Description must be at most 1,000 characters.", [], None
+            task.description = description
+            task.save(update_fields=["description"])
+            return "success", f"Done. I updated the description of “{task.title}”.", [task], [str(task.id)]
+        if clear_due_match:
+            task.due_date = None
+            task.save(update_fields=["due_date"])
+            return "success", f"Done. I removed the due date from “{task.title}”.", [task], [str(task.id)]
+        due, due_error = resolve_due_phrase(due_match.group(2).strip())
+        if due_error:
+            return "error", due_error, [], None
+        task.due_date = due
+        task.save(update_fields=["due_date"])
+        return "success", f"Done. I set the due date of “{task.title}” to {due.isoformat()}.", [task], [str(task.id)]
     if re.search(r"^(delete|remove)\b", lower):
         phrase = re.sub(r"^(delete|remove)( the| my)?\s*", "", text, flags=re.I).strip().strip("\"'“”").strip()
         found = resolve_title_candidates(phrase, tasks)
@@ -509,8 +571,8 @@ def chat_messages(request):
         search_text = re.sub(r"^(tasks?\s+)?(related to|about|that are)\s+", "", search_text, flags=re.I).strip()
         result_filter = {
             key: value for key, value in {
-                "q": None if re.search(r"\b(high|urgent|medium|low)[-\s]+priority\b|\b(completed|done|unfinished|open|overdue|today(?:'s)?|tomorrow|no[-\s]+due|without\s+due\s+date)\b", text, re.I) else normalize_query(search_text),
-                "status": "done" if re.search(r"\b(completed|done)\b", text, re.I) else "open" if re.search(r"\b(unfinished|open)\b", text, re.I) else None,
+                "q": None if re.search(r"\b(high|urgent|medium|low)[-\s]+priority\b|\b(in[-\s]+progress|to[-\s]+do|todo|completed|done|unfinished|open|overdue|today(?:'s)?|tomorrow|no[-\s]+due|without\s+due\s+date)\b", text, re.I) else normalize_query(search_text),
+                "status": "progress" if re.search(r"\bin[-\s]+progress\b", text, re.I) else "done" if re.search(r"\b(completed|done)\b", text, re.I) else "open" if re.search(r"\b(unfinished|open)\b", text, re.I) else None,
                 "priority": "high" if re.search(r"\b(high|urgent)[-\s]+priority\b", text, re.I) else "medium" if re.search(r"\bmedium[-\s]+priority\b", text, re.I) else "low" if re.search(r"\blow[-\s]+priority\b", text, re.I) else None,
                 "due": "overdue" if re.search(r"\boverdue\b", text, re.I) else "today" if re.search(r"\btoday(?:'s)?\b", text, re.I) else "tomorrow" if re.search(r"\btomorrow\b", text, re.I) else "none" if re.search(r"\b(no|without| missing)\s+due\s+date\b|\bno[-\s]+due\b", text, re.I) else None,
             }.items() if value
